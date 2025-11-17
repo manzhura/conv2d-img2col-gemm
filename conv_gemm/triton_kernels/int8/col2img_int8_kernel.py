@@ -72,35 +72,38 @@ def col2img_int32_kernel(
 
 
 def col2img_int32(
-    cols_i32: torch.Tensor,
+    cols_i32: torch.Tensor,  # [M, K] int32, M = N*Ho*Wo, K = Cin*Kh*Kw
     N: int, Cin: int, H: int, W: int,
     Kh: int, Kw: int,
     Sh: int, Sw: int,
     Ph: int, Pw: int,
     Dh: int, Dw: int,
-    BLOCK_M: int = INT32_C2I_BLOCK_M,
-    BLOCK_K: int = INT32_C2I_BLOCK_K,
+    BLOCK_M: int,
+    BLOCK_K: int,
     num_warps: int = 4,
     num_stages: int = 2,
-) -> torch.Tensor:
+):
     """
-    cols_i32: [M,K] int32 (например, результат GEMM-grad по cols)
-    return x_i32: [N, Cin, H, W] int32 (потом сам переведёшь в float и масштаб)
+    Обёртка для col2img_int32_kernel.
+    Восстанавливает x_i32: [N, Cin, H, W] из cols_i32[int32][M,K].
     """
-    assert cols_i32.is_cuda and cols_i32.dtype == torch.int32
-    device = cols_i32.device
+    assert cols_i32.is_cuda
+    assert cols_i32.dtype == torch.int32
+    cols_i32 = cols_i32.contiguous()
 
+    # считаем Ho, Wo так же, как в img2col
     Ho = (H + 2 * Ph - Dh * (Kh - 1) - 1) // Sh + 1
     Wo = (W + 2 * Pw - Dw * (Kw - 1) - 1) // Sw + 1
+    M = N * Ho * Wo
+    K = Cin * Kh * Kw
 
-    M, K = cols_i32.shape
-    assert M == N * Ho * Wo
-    assert K == Cin * Kh * Kw
+    assert cols_i32.shape == (M, K), f"cols shape {cols_i32.shape}, expected {(M, K)}"
 
-    x_i32 = torch.zeros((N, Cin, H, W), device=device, dtype=torch.int32)
+    x_i32 = torch.zeros((N, Cin, H, W), device=cols_i32.device, dtype=torch.int32)
     sN, sC, sH, sW = x_i32.stride()
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+
     col2img_int32_kernel[grid](
         cols_i32, x_i32,
         N, Cin, H, W,
@@ -113,4 +116,5 @@ def col2img_int32(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+
     return x_i32
