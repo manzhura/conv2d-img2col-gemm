@@ -60,15 +60,21 @@ class TritonConv2dINT8(nn.Module):
         self.dilation     = dilation
 
         # --- master weights всегда в FP32 ---
-        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kh, kw))
-        self.bias   = nn.Parameter(torch.empty(out_channels)) if bias else None
+        w_f = torch.empty(out_channels, in_channels, kh, kw)
+        torch.nn.init.kaiming_uniform_(w_f, a=math.sqrt(5))
+        w_int8 = torch.clamp(w_f, -128, 127).round().to(torch.int8)
+        self.register_buffer("weight", w_int8)
 
-        # инициализация как в nn.Conv2d
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
+        # --- bias ---
+        if bias:
             fan_in = in_channels * kh * kw
-            bound = 1.0 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
+            bound = 1 / math.sqrt(fan_in)
+            b = torch.empty(out_channels)
+            torch.nn.init.uniform_(b, -bound, bound)
+            # bias в float32, добавляем уже к float-выходу
+            self.bias = torch.nn.Parameter(b.float())
+        else:
+            self.bias = None
 
         # режим и "тень" (пока без реальной отдельной квантизации)
         if precision_mode not in ("int8_infer", "int8_runtime"):
@@ -76,18 +82,28 @@ class TritonConv2dINT8(nn.Module):
         self.precision_mode = precision_mode
         self.use_weight_shadow = use_weight_shadow
 
-    # публичный переключатель режима
-    def set_precision(self, mode: str):
-        if mode not in ("int8_infer", "int8_runtime"):
-            raise ValueError("precision_mode must be 'int8_infer' | 'int8_runtime'")
-        self.precision_mode = mode
+        # # Тюнинг кернелов
+        # self.BLOCK_M = BLOCK_M
+        # self.BLOCK_N = BLOCK_N
+        # self.BLOCK_K = BLOCK_K
+        # self.NUM_WARPS = NUM_WARPS
+        # self.NUM_STAGES = NUM_STAGES
+
+        self.register_buffer(
+            "channel_mask",
+            torch.ones(out_channels, dtype=torch.bool),
+            persistent=True,
+        )
+        self.register_buffer(
+            "input_channel_mask",
+            torch.ones(in_channels, dtype=torch.bool),
+            persistent=True,
+        )
+        self.block_size = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.is_cuda and self.weight.is_cuda, "x и weight должны быть на CUDA"
 
-        # ВАЖНО:
-        #  * quant активаций и весов делает TritonConv2dInt8Fn внутри (quantize_int8_sym)
-        #  * здесь мы только вызываем Function и решаем, в каком dtype вернуть результат
 
         y = TritonConv2dInt8Fn.apply(
             x,               # x (fp16 или fp32) -> внутри квантуется в int8

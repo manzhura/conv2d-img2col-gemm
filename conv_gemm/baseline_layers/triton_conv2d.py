@@ -14,8 +14,10 @@ class TritonConv2d(torch.nn.Module):
         NUM_WARPS=4, NUM_STAGES=2,
     ):
         super().__init__()
-        if isinstance(kernel_size, int): kh = kw = kernel_size
-        else: kh, kw = kernel_size
+        if isinstance(kernel_size, int):
+            kh = kw = kernel_size
+        else:
+            kh, kw = kernel_size
         if isinstance(stride, int):   stride = (stride, stride)
         if isinstance(padding, int):  padding = (padding, padding)
         if isinstance(dilation, int): dilation = (dilation, dilation)
@@ -49,6 +51,7 @@ class TritonConv2d(torch.nn.Module):
         self.BLOCK_K   = BLOCK_K
         self.NUM_WARPS = NUM_WARPS
         self.NUM_STAGES = NUM_STAGES
+
         self.register_buffer(
             "channel_mask",
             torch.ones(out_channels, dtype=torch.bool),
