@@ -161,3 +161,104 @@ class TritonConv2dInt8Fn(Function):
         y_fp32 = y_fp32.view(N, Ho, Wo, Cout).permute(0, 3, 1, 2).contiguous()
 
         return y_fp32
+
+    @staticmethod
+    def backward(ctx, gy):
+        x, w, bias = ctx.saved_tensors
+        (N, Cin, H, W, Cout, Kh, Kw, Ho, Wo) = ctx.shape_io
+        Sh, Sw = ctx.stride
+        Ph, Pw = ctx.padding
+        Dh, Dw = ctx.dilation
+
+        M = N * Ho * Wo
+        K = Cin * Kh * Kw
+
+        gy32 = gy.float()
+        x32 = x.float()
+        w32 = w.float()
+
+        # --------- dBias --------
+        gb = gy32.sum((0, 2, 3)) if bias is not None else None
+
+        # ============================================================
+        #                              dW
+        # ============================================================
+        cols = torch.empty((M, K), device=x.device, dtype=torch.float32)
+
+        grid_i2c = (
+            triton.cdiv(M, FP32_I2C_BLOCK_M),
+            triton.cdiv(K, FP32_I2C_BLOCK_K),
+        )
+
+        img2col_kernel[grid_i2c](
+            x32, cols,
+            N, Cin, H, W,
+            Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw,
+            Ho, Wo,
+            *x32.stride(),
+            K,
+            BLOCK_M=FP32_I2C_BLOCK_M,
+            BLOCK_K=FP32_I2C_BLOCK_K,
+            CAST_FP16=False,
+            num_warps=FP32_I2C_WARPS,
+            num_stages=FP32_I2C_STAGES,
+        )
+
+        dy_mat = gy32.permute(0, 2, 3, 1).reshape(M, Cout)
+        cols_T = cols.t().contiguous()
+
+        dW_mat = triton_gemm(
+            cols_T, dy_mat,
+            use_fp16=False,
+            BLOCK_M=FP32_GEMM_BLOCK_M,
+            BLOCK_N=FP32_GEMM_BLOCK_N,
+            BLOCK_K=FP32_GEMM_BLOCK_K,
+            num_warps=FP32_GEMM_WARPS,
+            num_stages=FP32_GEMM_STAGES,
+        )
+
+        gw = dW_mat.view(Cin, Kh, Kw, Cout).permute(3, 0, 1, 2).contiguous()
+
+        # ============================================================
+        #                               dX
+        # ============================================================
+        W_matT = w32.view(Cout, -1)
+
+        dcols = triton_gemm(
+            dy_mat, W_matT,
+            use_fp16=False,
+            BLOCK_M=FP32_GEMM_BLOCK_M,
+            BLOCK_N=FP32_GEMM_BLOCK_K,
+            BLOCK_K=Cout,
+            num_warps=FP32_GEMM_WARPS,
+            num_stages=FP32_GEMM_STAGES,
+        )
+
+        dx32 = torch.zeros((N, Cin, H, W), device=x.device, dtype=torch.float32)
+
+        grid_c2i = (
+            triton.cdiv(M, FP32_C2I_BLOCK_M),
+            triton.cdiv(K, FP32_C2I_BLOCK_K),
+        )
+
+        col2img_kernel[grid_c2i](
+            dcols, dx32,
+            N, Cin, H, W,
+            Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw,
+            Ho, Wo,
+            *dx32.stride(),
+            K,
+            BLOCK_M=FP32_C2I_BLOCK_M,
+            BLOCK_K=FP32_C2I_BLOCK_K,
+            num_warps=FP32_C2I_WARPS,
+            num_stages=FP32_C2I_STAGES,
+        )
+
+        return (
+            dx32.to(x.dtype, copy=False),
+            gw.to(w.dtype, copy=False),
+            gb.to(bias.dtype, copy=False) if bias is not None else None,
+            None, None, None,  # для stride, padding, dilation
+        )
+
+
