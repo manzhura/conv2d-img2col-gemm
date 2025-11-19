@@ -58,7 +58,7 @@ FP32_C2I_STAGES  = 2
 from conv_gemm.triton_kernels.int8.img2col_int8_kernel import img2col_int8
 from conv_gemm.triton_kernels.int8.gemm_int8_kernel  import gemm_int8_tc
 from conv_gemm.triton_kernels.int8.col2img_int8_kernel import col2img_int32
-from conv_gemm.triton_kernels.int8.int8_quant import quantize_int8_sym
+from conv_gemm.triton_kernels.int8.int8_quant import quantize_int8_sym_tensor
 from conv_gemm.triton_kernels.fp32.img2col_kernel import img2col_kernel
 from conv_gemm.triton_kernels.fp32.col2img_kernel import col2img_kernel
 from conv_gemm.triton_kernels.fp32.gemm_kernel import triton_gemm
@@ -68,41 +68,47 @@ from conv_gemm.triton_kernels.fp32.gemm_kernel import triton_gemm
 # ============================================================
 #             AUTOGRAD FUNCTION (INT8 FORWARD + FP32 BACKWARD)
 # ============================================================
-
 class TritonConv2dInt8Fn(Function):
 
     @staticmethod
-    def _out_hw(H, W, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw):
-        Ho = (H + 2*Ph - Dh*(Kh-1) - 1)//Sh + 1
-        Wo = (W + 2*Pw - Dw*(Kw-1) - 1)//Sw + 1
-        return Ho, Wo
+    def forward(ctx,
+                x_q,
+                w_q,
+                w_scale,
+                bias,
+                stride,
+                padding,
+                dilation,
+                act_scale):
 
+        assert x_q.dtype == torch.int8
+        assert w_q.dtype == torch.int8
 
-    # ============================================================
-    #                         FORWARD
-    # ============================================================
-    @staticmethod
-    def forward(ctx, x, w, w_scale, bias, stride, padding, dilation):
-        assert x.is_cuda and w.is_cuda
-
-        N, Cin, H, W = x.shape
-        Cout, Cinw, Kh, Kw = w.shape
-        assert Cin == Cinw
+        N, Cin, H, W = x_q.shape
+        Cout, Cin2, Kh, Kw = w_q.shape
+        assert Cin == Cin2
 
         Sh, Sw = stride
         Ph, Pw = padding
         Dh, Dw = dilation
 
-        Ho, Wo = TritonConv2dInt8Fn._out_hw(H, W, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw)
-
+        # ============================================================
+        # 1. Compute output spatial shape
+        # ============================================================
+        Ho = (H + 2 * Ph - Dh * (Kh - 1) - 1) // Sh + 1
+        Wo = (W + 2 * Pw - Dw * (Kw - 1) - 1) // Sw + 1
         M = N * Ho * Wo
-        K = Cin * Kh * Kw
-        K_pad = ((K + 3) // 4) * 4   # align to 4
 
-        # ----------- Quantize -----------
-        x_q, s_x = quantize_int8_sym(x)
+        # ============================================================
+        # 2. Compute real K and padded K (MUST MATCH kernels)
+        # ============================================================
+        K_real = Cin * Kh * Kw
+        K_pad = ((K_real + 3) // 4) * 4
 
-        # ----------- INT8 img2col -----------
+        # ============================================================
+        # 3. img2col INT8  (НОВАЯ СИГНАТУРА!)
+        #    returns: cols_q [M, K_pad]
+        # ============================================================
         cols_q, _ = img2col_int8(
             x_q,
             Kh, Kw,
@@ -110,46 +116,48 @@ class TritonConv2dInt8Fn(Function):
             Ph, Pw,
             Dh, Dw,
             K_pad,
-            BLOCK_M=INT8_I2C_BLOCK_M,
-            BLOCK_K=INT8_I2C_BLOCK_K,
-            num_warps=INT8_I2C_WARPS,
-            num_stages=INT8_I2C_STAGES,
-        )   # → [M, K_pad], int8
+            INT8_I2C_BLOCK_M,
+            INT8_I2C_BLOCK_K,
+            INT8_I2C_WARPS,
+            INT8_I2C_STAGES,
+        )
+        # cols_q exactly shape [M, K_pad]
 
-        # ----------- Pad weights to K_pad -----------
-        W_mat_raw = w.view(Cout, -1).t().contiguous()   # [K, Cout]
-        if K_pad != K:
-            W_mat = torch.nn.functional.pad(
-                W_mat_raw, (0, 0, 0, K_pad - K)
-            )
-        else:
-            W_mat = W_mat_raw
+        # ============================================================
+        # 4. Prepare weight matrix (W_q) → [K_pad, Cout]
+        # ============================================================
+        Wmat = w_q.view(Cout, K_real).t().contiguous()  # [K_real, Cout]
 
-        # ----------- INT8 GEMM -----------
+        if K_pad != K_real:
+            Wmat = torch.nn.functional.pad(Wmat, (0, 0, 0, K_pad - K_real))
+            # Wmat: [K_pad, Cout]
+
+        # ============================================================
+        # 5. GEMM INT8 → int32 output [M, Cout]
+        # ============================================================
         Y_i32 = gemm_int8_tc(
-            cols_q,
-            W_mat,
-            BLOCK_M=INT8_GEMM_BLOCK_M,
-            BLOCK_N=INT8_GEMM_BLOCK_N,
-            BLOCK_K=INT8_GEMM_BLOCK_K,
-            num_warps=INT8_GEMM_WARPS,
-            num_stages=INT8_GEMM_STAGES,
-        )  # [M, Cout], int32
+            cols_q,  # [M, K_pad]
+            Wmat,  # [K_pad, Cout]
+            INT8_GEMM_BLOCK_M,
+            INT8_GEMM_BLOCK_N,
+            INT8_GEMM_BLOCK_K,
+            INT8_GEMM_WARPS,
+            INT8_GEMM_STAGES,
+        )
 
-        # ----------- DEQUANT + BIAS -----------
-        y_fp32 = Y_i32.float() * (s_x * w_scale)
+        # ============================================================
+        # 6. Dequantization:
+        #    y = int32 * (scale_x * scale_w)
+        # ============================================================
+        deq = float(w_scale) * float(act_scale)
+        y_fp32 = Y_i32.float() * deq
+
         if bias is not None:
-            y_fp32 += bias.float().view(1, -1)
+            y_fp32 += bias.float()
 
-        y = y_fp32.view(N, Ho, Wo, Cout).permute(0, 3, 1, 2).contiguous()
+        # ============================================================
+        # 7. Reshape → [N, Cout, Ho, Wo]
+        # ============================================================
+        y_fp32 = y_fp32.view(N, Ho, Wo, Cout).permute(0, 3, 1, 2).contiguous()
 
-        # ----------- SAVE FOR BACKWARD -----------
-        ctx.save_for_backward(x, w, w_scale, bias)
-        ctx.shape_io = (N, Cin, H, W, Cout, Kh, Kw, Ho, Wo)
-        ctx.stride = stride
-        ctx.padding = padding
-        ctx.dilation = dilation
-
-        return y.to(x.dtype, copy=False)
-
-
+        return y_fp32

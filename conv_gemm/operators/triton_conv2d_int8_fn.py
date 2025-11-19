@@ -58,8 +58,12 @@ FP32_C2I_STAGES  = 2
 from conv_gemm.triton_kernels.int8.img2col_int8_kernel import img2col_int8
 from conv_gemm.triton_kernels.int8.gemm_int8_kernel  import gemm_int8_tc
 from conv_gemm.triton_kernels.int8.col2img_int8_kernel import col2img_int32
-from conv_gemm.triton_kernels.int8.int8_quant import quantize_int8_sym
-
+from conv_gemm.triton_kernels.int8.int8_quant import (
+    quantize_int8_sym_per_tensor,
+    quantize_int8_asym_per_tensor,
+    quantize_int8_sym_per_channel,
+    quantize_int8_asym_per_channel,
+)
 from conv_gemm.triton_kernels.fp32.img2col_kernel import img2col_kernel
 from conv_gemm.triton_kernels.fp32.col2img_kernel import col2img_kernel
 from conv_gemm.triton_kernels.fp32.gemm_kernel import triton_gemm

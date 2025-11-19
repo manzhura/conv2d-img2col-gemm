@@ -3,25 +3,20 @@ import torch
 import torch.nn as nn
 
 from conv_gemm.baseline_operators.triton_conv2d_int8_fn import TritonConv2dInt8Fn
-from conv_gemm.triton_kernels.int8.int8_quant import quantize_int8_sym
-
 
 
 class TritonConv2dINT8(nn.Module):
+    """
+    Обёртка над TritonConv2dInt8Fn:
+    - хранит INT8-веса и их scale
+    - хранит scale для активаций
+    - НЕ занимается квантизацией внутри forward
+    """
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        bias: bool = True,
-    ):
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, dilation=1, bias=True):
         super().__init__()
 
-        # --- нормализуем аргументы kernel/stride/padding/dilation ---
         if isinstance(kernel_size, int):
             kh = kw = kernel_size
         else:
@@ -34,73 +29,93 @@ class TritonConv2dINT8(nn.Module):
         if isinstance(dilation, int):
             dilation = (dilation, dilation)
 
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.kernel_size  = (kh, kw)
-        self.stride       = stride
-        self.padding      = padding
-        self.dilation     = dilation
-        # === инициализация весов во float, КВАНТИЗАЦИЯ ОДИН РАЗ ===
-        w_f = torch.empty(out_channels, in_channels, kh, kw)
-        torch.nn.init.kaiming_uniform_(w_f, a=math.sqrt(5))
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
 
-        w_q, weight_scale  = quantize_int8_sym(w_f)
-
-        # int8-параметр (forward-only, градиенты не нужны)
-        self.weight = torch.nn.Parameter(w_q, requires_grad=False)
-        # scale для весов — храним как буфер
-        self.register_buffer(
-            "weight_scale",
-            torch.tensor(weight_scale, dtype=torch.float32),
-            persistent=True,
+        # INT8 веса (квантизованные извне)
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, kh, kw, dtype=torch.int8),
+            requires_grad=False,
         )
-        # === bias: FP32 ===
+
+        # Один скалярный scale для весов
+        self.register_buffer("weight_scale", torch.tensor(1.0, dtype=torch.float32))
+        # zp для симметрии не используется, но оставим для совместимости
+        self.register_buffer("weight_zp", torch.tensor(0, dtype=torch.int32))
+
         if bias:
-            fan_in = in_channels * kh * kw
-            bound = 1 / math.sqrt(fan_in)
-            b = torch.empty(out_channels)
-            torch.nn.init.uniform_(b, -bound, bound)
-            self.bias = torch.nn.Parameter(b.float(), requires_grad=False)
+            self.bias = nn.Parameter(
+                torch.zeros(out_channels, dtype=torch.float32),
+                requires_grad=False,
+            )
         else:
             self.bias = None
 
-        # # Тюнинг кернелов
-        # self.BLOCK_M = BLOCK_M
-        # self.BLOCK_N = BLOCK_N
-        # self.BLOCK_K = BLOCK_K
-        # self.NUM_WARPS = NUM_WARPS
-        # self.NUM_STAGES = NUM_STAGES
+        # Scale для активаций (один скаляр, калибруется извне)
+        self.register_buffer("act_scale", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("act_zp", torch.tensor(0, dtype=torch.int32))
 
-        # Маски разреженности
-        self.register_buffer(
-            "channel_mask",
-            torch.ones(out_channels, dtype=torch.bool),
-            persistent=True,
+    # ==== ЗАГРУЗКА КВАНТ-ПАРАМОВ (вызов из PTQ-калибратора) ====
+    @torch.no_grad()
+    def load_quant_params(self,
+                          w_q: torch.Tensor,
+                          w_scale: torch.Tensor,
+                          act_scale: torch.Tensor,
+                          bias: torch.Tensor | None = None):
+        """
+        Сюда приходят УЖЕ ГОТОВЫЕ:
+          - w_q: int8 веса формы [Cout, Cin, Kh, Kw]
+          - w_scale: скалярный scale для весов
+          - act_scale: скалярный scale для активаций
+        НИКАКОЙ квантизации здесь нет — только copy_ внутрь слоя.
+        """
+
+        assert w_q.dtype == torch.int8, f"w_q must be int8, got {w_q.dtype}"
+        assert w_q.shape == self.weight.shape, (
+            f"w_q shape {w_q.shape} != layer weight shape {self.weight.shape}"
         )
-        self.register_buffer(
-            "input_channel_mask",
-            torch.ones(in_channels, dtype=torch.bool),
-            persistent=True,
-        )
 
-        self.block_size = None
+        self.weight.copy_(w_q)
+        self.weight_scale.copy_(w_scale.view(()))
+        self.act_scale.copy_(act_scale.view(()))
 
+        if bias is not None:
+            assert self.bias is not None, "Layer was created with bias=False"
+            assert bias.shape == self.bias.shape, (
+                f"bias shape {bias.shape} != layer bias shape {self.bias.shape}"
+            )
+            self.bias.copy_(bias.float())
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.is_cuda and self.weight.is_cuda
+    # ==== ИНФЕРЕНС ====
+    def forward(self, x_q: torch.Tensor):
+        """
+        СЮДА ПРИХОДИТ УЖЕ КВАНТИЗОВАННЫЙ x_q (int8),
+        сконверченный с использованием self.act_scale.
+        НИКАКОЙ КВАНТИЗАЦИИ ВНУТРИ НЕ ДЕЛАЕМ.
+        """
 
-        #    Сигнатура Fn: apply(x_int8, w_int8, stride, padding, dilation)
-        y = TritonConv2dInt8Fn.apply(
-            x,
+        assert x_q.dtype == torch.int8, f"expected int8 input, got {x_q.dtype}"
+        assert x_q.is_cuda, "x_q must be on CUDA"
+
+        return TritonConv2dInt8Fn.apply(
+            x_q,
             self.weight,
             self.weight_scale,
             self.bias,
             self.stride,
             self.padding,
             self.dilation,
+            self.act_scale,
         )
 
-
-
-        # можешь вернуть float32 или .half() — на твой вкус
-        return y
+    # ==== УДОБНЫЙ ХЕЛПЕР ДЛЯ КВАНТИЗАЦИИ ВХОДА С УЖЕ ЗАДАННЫМ act_scale ====
+    @torch.no_grad()
+    def quantize_input(self, x_fp: torch.Tensor) -> torch.Tensor:
+        """
+        """
+        x_fp = x_fp.to(torch.float32)
+        s = float(self.act_scale)
+        # Здесь НЕТ пересчёта scale – только "apply" уже известного
+        x_q = torch.clamp(torch.round(x_fp / s), -128, 127).to(torch.int8)
+        return x_q
