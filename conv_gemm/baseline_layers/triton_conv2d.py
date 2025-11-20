@@ -78,7 +78,7 @@ class TritonConv2d(torch.nn.Module):
             self.BLOCK_M, self.BLOCK_N, self.BLOCK_K,
             self.NUM_WARPS, self.NUM_STAGES,
         )
-        return y # мб халф
+        return y.float()  # возвращаем fp32 чтобы быть совместимыми с остальной моделью
 
     # ===== Sparsity helpers =====
     def set_channel_mask(self, mask: torch.Tensor | None):
