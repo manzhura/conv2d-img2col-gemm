@@ -6,7 +6,7 @@ from conv_gemm.baseline_operators.triton_conv2d_fp16_fn import TritonConv2dFn
 
 class TritonConv2d(torch.nn.Module):
     def __init__(
-        self, name, in_channels, out_channels, kernel_size,
+        self, in_channels, out_channels, kernel_size,
         stride=1, padding=0, dilation=1, bias=True,
     ):
         """
