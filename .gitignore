@@ -6,6 +6,7 @@
 *.py[cod]
 venv/
 env/
+data/
 venv_*/
 env_*/
 gemm-int8/
