@@ -2,16 +2,6 @@ import triton
 import triton.language as tl
 
 
-BEST_BLOCK_M, BEST_BLOCK_N, BEST_BLOCK_K = 64, 64, 32
-BEST_NUM_WARPS, BEST_NUM_STAGES = 4, 2
-import triton
-import triton.language as tl
-
-BEST_BLOCK_M, BEST_BLOCK_N, BEST_BLOCK_K = 64, 64, 32
-BEST_NUM_WARPS, BEST_NUM_STAGES = 4, 2
-
-
-
 @triton.jit
 def img2col_kernel(
     x_ptr, cols_ptr,
@@ -34,14 +24,12 @@ def img2col_kernel(
     mask_m = offs_m < M
     mask_k = offs_k < K
 
-    # offs_m -> (n, ho, wo)
     n  = offs_m // (Ho * Wo)
     t  = offs_m %  (Ho * Wo)
     ho = t // Wo
     wo = t %  Wo
     n  = n[:, None]; ho = ho[:, None]; wo = wo[:, None]
 
-    # offs_k -> (cin, kh, kw)
     cin = offs_k // (Kh * Kw)
     r   = offs_k %  (Kh * Kw)
     kh  = r // Kw

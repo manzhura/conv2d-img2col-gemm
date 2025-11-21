@@ -22,7 +22,7 @@ class TritonConv2d(torch.nn.Module):
         stride=1, padding=0, dilation=1, bias=True,
         BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
         NUM_WARPS=4, NUM_STAGES=2,
-        precision_mode="fp32",
+        precision_mode="fp16",
         use_weight_shadow=True
     ):
         super().__init__()
@@ -63,12 +63,12 @@ class TritonConv2d(torch.nn.Module):
 
     # публичный переключатель режимов
     def set_precision(self, mode):
-        if mode not in ("fp32", "fp16_runtime", "fp16_infer"):
-            raise ValueError("precision_mode must be 'fp32' | 'fp16_runtime' | 'fp16_infer'")
+        if mode not in ("fp16", "fp16_runtime", "fp16_infer"):
+            raise ValueError("precision_mode must be 'fp16' | 'fp16_runtime' | 'fp16_infer'")
         self.precision_mode = mode
 
         with torch.no_grad():
-            if mode == "fp32":
+            if mode == "fp16":
                 self.weight.data = self.weight.data.float()
                 if self.bias is not None:
                     self.bias.data = self.bias.data.float()
@@ -94,7 +94,7 @@ class TritonConv2d(torch.nn.Module):
     def forward(self, x):
         assert x.is_cuda and self.weight.is_cuda
 
-        if self.precision_mode == "fp32":
+        if self.precision_mode == "fp16":
             x_in = x.float()
             w_in = self.weight.float()
             I2C_FP16 = False; GEMM_FP16 = False
@@ -118,7 +118,7 @@ class TritonConv2d(torch.nn.Module):
             I2C_FP16, GEMM_FP16
         )
 
-        if self.precision_mode == "fp32":
+        if self.precision_mode == "fp16":
             return y
         elif self.precision_mode == "fp16_infer":
             return y

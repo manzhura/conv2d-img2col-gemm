@@ -1,19 +1,17 @@
-# conv_gemm/triton_kernels/fp32/gemm_kernel.py
 import torch, triton
 import triton.language as tl
-
-BEST_BLOCK_M, BEST_BLOCK_N, BEST_BLOCK_K = 64, 64, 64
-BEST_NUM_WARPS, BEST_NUM_STAGES = 4, 2
 
 
 @triton.jit
 def gemm_kernel(
-    A_ptr, B_ptr, C_ptr,          # A[M,K], B[K,N], C[M,N]
+    A_ptr, B_ptr, C_ptr,
     M, N, K,
-    stride_am, stride_ak,         # strides for A
-    stride_bk, stride_bn,         # strides for B
-    stride_cm, stride_cn,         # strides for C
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     USE_FP16: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -30,7 +28,6 @@ def gemm_kernel(
         mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
         mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
 
-        # other=0 — не поднимаем dtype случайно до fp32 раньше времени
         a = tl.load(
             A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
             mask=mask_a, other=0
@@ -43,7 +40,8 @@ def gemm_kernel(
         if USE_FP16:
             a = a.to(tl.float16)
             b = b.to(tl.float16)
-        # acc остаётся fp32
+
+        # acc  fp16
         acc += tl.dot(a, b, allow_tf32=False)
 
     tl.store(
@@ -54,16 +52,17 @@ def gemm_kernel(
 
 
 def triton_gemm(
-    A: torch.Tensor, B: torch.Tensor,
-    *, use_fp16: bool = False,
-    BLOCK_M: int = BEST_BLOCK_M, BLOCK_N: int = BEST_BLOCK_N, BLOCK_K: int = BEST_BLOCK_K,
-    num_warps: int = BEST_NUM_WARPS, num_stages: int = BEST_NUM_STAGES,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        *,
+        use_fp16: bool = False,
+        BLOCK_M: int | None = None,
+        BLOCK_N: int | None = None,
+        BLOCK_K: int | None = None,
+        num_warps: int | None = None,
+        num_stages: int | None = None,
 ) -> torch.Tensor:
-    """
-    Вычисляет C = A @ B.
-    Формы: A[M,K], B[K,N] (любой strides), возвращает C[M,N] (fp32).
-    В fp16-режиме входы конвертятся в half, аккум — всегда fp32.
-    """
+
     assert A.is_cuda and B.is_cuda
     assert A.dim() == 2 and B.dim() == 2
     M, K1 = A.shape

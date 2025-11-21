@@ -12,7 +12,7 @@ class TritonConv2dINT8(nn.Module):
     Режимы:
       - "int8_infer":
           * forward считает через INT8-кернелы (квантизация внутри Function)
-          * наружу возвращаем тот же dtype, что у входа x (обычно fp16/fp32)
+          * наружу возвращаем тот же dtype, что у входа x (обычно fp16/fp16)
           * предполагается чистый инференс, градиенты можно игнорировать
 
       - "int8_runtime":
@@ -106,7 +106,7 @@ class TritonConv2dINT8(nn.Module):
 
 
         y = TritonConv2dInt8Fn.apply(
-            x,               # x (fp16 или fp32) -> внутри квантуется в int8
+            x,               # x (fp16 или fp16) -> внутри квантуется в int8
             self.weight,     # master FP32 weights -> внутри квантуются в int8
             self.bias,
             self.stride,

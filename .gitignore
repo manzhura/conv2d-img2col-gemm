@@ -8,3 +8,7 @@ venv/
 env/
 venv_*/
 env_*/
+gemm-int8/
+conv_gemm/layers/
+conv_gemm/operators/
+data/

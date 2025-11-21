@@ -1,48 +1,44 @@
-# conv_gemm/operators/triton_conv2d_fp32_fn.py
-
 import torch
 import triton
 
-from conv_gemm.triton_kernels.fp32.img2col_kernel import img2col_kernel
-from conv_gemm.triton_kernels.fp32.col2img_kernel import col2img_kernel
-from conv_gemm.triton_kernels.fp32.gemm_kernel import triton_gemm
+from conv_gemm.triton_kernels.fp16.img2col_kernel import img2col_kernel
+from conv_gemm.triton_kernels.fp16.col2img_kernel import col2img_kernel
+from conv_gemm.triton_kernels.fp16.gemm_kernel import triton_gemm
+
+from conv_gemm.configs.kernel_config import FP16_I2C_CFG, FP16_GEMM_CFG,FP32_C2I_CFG
 
 
 class TritonConv2dFn(torch.autograd.Function):
     @staticmethod
-    def _out_hw(H, W, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw):
-        Ho = (H + 2 * Ph - Dh * (Kh - 1) - 1) // Sh + 1
-        Wo = (W + 2 * Pw - Dw * (Kw - 1) - 1) // Sw + 1
-        return Ho, Wo
-
-    @staticmethod
     def forward(
-        ctx,
-        x,
-        w,
-        bias,
-        channel_mask,
-        input_mask,
-        grad_channel_mask,
-        grad_input_mask,
-        stride,
-        padding,
-        dilation,
-        BLOCK_M=128,
-        BLOCK_N=128,
-        BLOCK_K=64,
-        NUM_WARPS=4,
-        NUM_STAGES=2,
+        ctx, x, w, bias,
+        channel_mask, input_mask, grad_channel_mask,
+        grad_input_mask, stride, padding, dilation,
     ):
+        """
+        Forward-проход свёртки на Triton с динамической спарсификацией.
+        Возможности:
+        • FP16 forward: img2col → GEMM → col2img.
+        • Учитывает sparsity по входным и выходным каналам:
+            - input_mask уменьшает Cin_eff и K = Cin_eff * Kh * Kw.
+            - channel_mask уменьшает Cout_eff.
+        • GEMM реально работает на сжатых матрицах [M, K_eff] @ [K_eff, Cout_eff].
+        • Маски grad_* только сохраняются в ctx — используются в backward().
+        • Реконструирует полный выходной тензор, заполняя отрубленные каналы нулями.
+        Возвращает:
+        • y — результат свёртки с учётом sparsity (тип как у входа).
+        """
         assert x.is_cuda and w.is_cuda
+
         N, Cin, H, W_ = x.shape
         Cout, Cin_w, Kh, Kw = w.shape
         assert Cin == Cin_w
+
         Sh, Sw = stride
         Ph, Pw = padding
         Dh, Dw = dilation
 
-        # --- input mask (forward) ---
+        # input mask (forward)
         input_mask_bool = torch.ones(Cin, device=x.device, dtype=torch.bool)
         if input_mask is not None:
             mask_in = input_mask.to(device=x.device, dtype=torch.bool).view(-1)
@@ -63,7 +59,7 @@ class TritonConv2dFn(torch.autograd.Function):
             x_eff = x.index_select(1, input_active_idx)
             w_eff = w.index_select(1, input_active_idx)
 
-        # --- channel mask (forward) ---
+        # channel mask (forward)
         channel_mask_bool = torch.ones(Cout, device=w.device, dtype=torch.bool)
         if channel_mask is not None:
             mask = channel_mask.to(device=w.device, dtype=torch.bool).view(-1)
@@ -83,7 +79,7 @@ class TritonConv2dFn(torch.autograd.Function):
             w_eff = w_eff.index_select(0, active_idx)
             bias_eff = bias.index_select(0, active_idx) if bias is not None else None
 
-        # --- gradient masks ---
+        # gradient masks
         grad_input_mask_bool = input_mask_bool
         grad_input_override = False
         grad_input_active_idx = None
@@ -122,11 +118,11 @@ class TritonConv2dFn(torch.autograd.Function):
         M = N * Ho * Wo
         K = Cin_eff * Kh * Kw
 
-        # ---- img2col -> cols[M,K] ----
+        # img2col -> cols[M,K]
         cols_dtype = torch.float16
         cols = torch.empty((M, K), device=x.device, dtype=cols_dtype)
         sN, sC, sH, sW = x_eff.stride()
-        grid_i2c = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+        grid_i2c = (triton.cdiv(M, FP16_I2C_CFG.BLOCK_M), triton.cdiv(K, FP16_I2C_CFG.BLOCK_K))
         img2col_kernel[grid_i2c](
             x_eff, cols,
             N, Cin_eff, H, W_,
@@ -134,19 +130,19 @@ class TritonConv2dFn(torch.autograd.Function):
             Ho, Wo,
             sN, sC, sH, sW,
             K,
-            BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
-            CAST_FP16=(cols_dtype == torch.float16),
-            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+            BLOCK_M=FP16_I2C_CFG.BLOCK_M, BLOCK_K=FP16_I2C_CFG.BLOCK_K,
+            CAST_FP16=(cols_dtype == torch.float16), #  fp16 forward
+            num_warps=FP16_I2C_CFG.NUM_WARPS, num_stages=FP16_I2C_CFG.NUM_STAGES,
         )
 
-        # ---- GEMM: [M,K] @ [K,Cout] -> [M,Cout] ----
+        # GEMM [M,K] @ [K,Cout] -> [M,Cout]
         W_mat = w_eff.view(Cout_eff, -1).t().contiguous()
         y_col = triton_gemm(
             cols, W_mat,
             use_fp16=(cols_dtype == torch.float16),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            num_warps=NUM_WARPS, num_stages=NUM_STAGES
-        )  # fp32 output
+            BLOCK_M=FP16_GEMM_CFG.BLOCK_M, BLOCK_N=FP16_GEMM_CFG.BLOCK_N, BLOCK_K=FP16_GEMM_CFG.BLOCK_K,
+            num_warps=FP16_GEMM_CFG.NUM_WARPS, num_stages=FP16_GEMM_CFG.NUM_STAGES
+        )
 
         if bias_eff is not None:
             y_col.add_(bias_eff.float().view(1, -1))
@@ -164,8 +160,6 @@ class TritonConv2dFn(torch.autograd.Function):
         ctx.padding = padding
         ctx.dilation = dilation
         ctx.shape_io = (N, Cin, H, W_, Cout, Kh, Kw, Ho, Wo)
-        ctx.blocks = (BLOCK_M, BLOCK_N, BLOCK_K)
-        ctx.launch = (NUM_WARPS, NUM_STAGES)
         ctx.active_idx = active_idx
         ctx.input_active_idx = input_active_idx
         ctx.grad_active_idx = grad_active_idx
@@ -185,8 +179,6 @@ class TritonConv2dFn(torch.autograd.Function):
         Sh, Sw = ctx.stride
         Ph, Pw = ctx.padding
         Dh, Dw = ctx.dilation
-        BLOCK_M, BLOCK_N, BLOCK_K = ctx.blocks
-        NUM_WARPS, NUM_STAGES = ctx.launch
         active_idx = ctx.active_idx
         input_active_idx = ctx.input_active_idx
         grad_channel_override = ctx.grad_channel_override
@@ -247,7 +239,7 @@ class TritonConv2dFn(torch.autograd.Function):
 
         cols = torch.empty((M, K_grad), device=x.device, dtype=torch.float32)
         sN, sC, sH, sW = x_eff32.stride()
-        grid_i2c = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_grad, BLOCK_K))
+        grid_i2c = (triton.cdiv(M, FP16_I2C_CFG.BLOCK_M), triton.cdiv(K_grad, FP16_I2C_CFG.BLOCK_K))
         img2col_kernel[grid_i2c](
             x_eff32, cols,
             N, Cin_work, H, W_,
@@ -255,9 +247,9 @@ class TritonConv2dFn(torch.autograd.Function):
             Ho, Wo,
             sN, sC, sH, sW,
             K_grad,
-            BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
-            CAST_FP16=False,
-            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+            BLOCK_M=FP16_I2C_CFG.BLOCK_M, BLOCK_K=FP16_I2C_CFG.BLOCK_K,
+            CAST_FP16=False, #  fp16 backward
+            num_warps=FP16_I2C_CFG.NUM_WARPS, num_stages=FP16_I2C_CFG.NUM_STAGES,
         )
 
         dy_mat = gy_eff.permute(0, 2, 3, 1).contiguous().view(M, Cout_work)
@@ -266,8 +258,8 @@ class TritonConv2dFn(torch.autograd.Function):
         dW_mat = triton_gemm(
             cols_T, dy_mat,
             use_fp16=False,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+            BLOCK_M=FP16_GEMM_CFG.BLOCK_M, BLOCK_N=FP16_GEMM_CFG.BLOCK_N, BLOCK_K=FP16_GEMM_CFG.BLOCK_K,
+            num_warps=FP16_GEMM_CFG.NUM_WARPS, num_stages=FP16_GEMM_CFG.NUM_STAGES,
         )
         gw_grad32 = dW_mat.view(Cin_work, Kh, Kw, Cout_work).permute(3, 0, 1, 2).contiguous()
 
@@ -286,13 +278,13 @@ class TritonConv2dFn(torch.autograd.Function):
         dcols = triton_gemm(
             dy_mat, W_matT,
             use_fp16=False,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_K, BLOCK_K=BLOCK_K,
-            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+            BLOCK_M=FP16_GEMM_CFG.BLOCK_M, BLOCK_N=FP16_GEMM_CFG.BLOCK_K, BLOCK_K=FP16_GEMM_CFG.BLOCK_K,
+            num_warps=FP16_GEMM_CFG.NUM_WARPS, num_stages=FP16_GEMM_CFG.NUM_STAGES,
         )
 
         dx_eff32 = torch.zeros((N, Cin_work, H, W_), device=x.device, dtype=torch.float32)
         sN_dx, sC_dx, sH_dx, sW_dx = dx_eff32.stride()
-        grid_c2i = (triton.cdiv(M, BLOCK_M), triton.cdiv(K_grad, BLOCK_K))
+        grid_c2i = (triton.cdiv(M, FP32_C2I_CFG.BLOCK_M), triton.cdiv(K_grad, FP32_C2I_CFG.BLOCK_K))
         col2img_kernel[grid_c2i](
             dcols, dx_eff32,
             N, Cin_work, H, W_,
@@ -300,9 +292,9 @@ class TritonConv2dFn(torch.autograd.Function):
             Ho, Wo,
             sN_dx, sC_dx, sH_dx, sW_dx,
             K_grad,
-            BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
-            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
-        )
+            BLOCK_M=FP32_C2I_CFG.BLOCK_M, BLOCK_K=FP32_C2I_CFG.BLOCK_K,
+            num_warps=FP32_C2I_CFG.NUM_WARPS, num_stages=FP32_C2I_CFG.NUM_STAGES,
+        ) # fp32 для производной
         if in_idx is not None:
             dx32 = torch.zeros((N, Cin_full, H, W_), device=x.device, dtype=torch.float32)
             dx32.index_copy_(1, in_idx, dx_eff32)
@@ -313,20 +305,10 @@ class TritonConv2dFn(torch.autograd.Function):
         gw = gw_full.to(w.dtype, copy=False)
         gb = (gb_full.to(bias_stub.dtype, copy=False) if ctx.has_bias else None)
 
-        return (
-            dx,
-            gw,
-            gb,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return dx, gw, gb, None, None, None, None, None, None, None, None, None, None, None, None
+
+    @staticmethod
+    def _out_hw(H, W, Kh, Kw, Sh, Sw, Ph, Pw, Dh, Dw):
+        Ho = (H + 2 * Ph - Dh * (Kh - 1) - 1) // Sh + 1
+        Wo = (W + 2 * Pw - Dw * (Kw - 1) - 1) // Sw + 1
+        return Ho, Wo

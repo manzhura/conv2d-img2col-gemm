@@ -1,19 +1,25 @@
-# === TritonConv2d — nn.Module над твоим TritonConv2dFn ===
 import math
 import torch, triton
+
 from conv_gemm.baseline_operators.triton_conv2d_fp16_fn import TritonConv2dFn
-
-
 
 
 class TritonConv2d(torch.nn.Module):
     def __init__(
         self, in_channels, out_channels, kernel_size,
         stride=1, padding=0, dilation=1, bias=True,
-        BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
-        NUM_WARPS=4, NUM_STAGES=2,
     ):
+        """
+        TritonConv2d - свёртка на Triton с поддержкой спарсификации.
+        Функциональность:
+        • forward: FP16, img2col → GEMM → col2img, динамическая
+          sparsity по входным и выходным каналам.
+        • backward: FP32, те же img2col/GEMM/col2img, отдельные
+          sparsity-маски для градиентов.
+        • Маски уменьшают Cin/Cout, реально сокращая FLOPs.
+        """
         super().__init__()
+
         if isinstance(kernel_size, int):
             kh = kw = kernel_size
         else:
@@ -25,35 +31,28 @@ class TritonConv2d(torch.nn.Module):
         self.in_channels  = in_channels
         self.out_channels = out_channels
         self.kernel_size  = (kh, kw)
-        self.stride       = stride
-        self.padding      = padding
-        self.dilation     = dilation
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.block_size = None
+        self.grad_block_size = None
 
-        # --- weights INIT (СРАЗУ FP16) ---
+        # weights initialization
         w = torch.empty(out_channels, in_channels, kh, kw)
         torch.nn.init.kaiming_uniform_(w, a=math.sqrt(5))
         self.weight = torch.nn.Parameter(w.half())
 
-        # --- bias ---
+        #  bias initialization
         if bias:
             fan_in = in_channels * kh * kw
             bound = 1 / math.sqrt(fan_in)
             b = torch.empty(out_channels)
             torch.nn.init.uniform_(b, -bound, bound)
-            self.bias = torch.nn.Parameter(b.float())  # FP32 (лучше для накопления)
+            self.bias = torch.nn.Parameter(b.float())
         else:
             self.bias = None
 
-
-        # Тюнинг кернелов
-        self.BLOCK_M   = BLOCK_M
-        self.BLOCK_N   = BLOCK_N
-        self.BLOCK_K   = BLOCK_K
-        self.NUM_WARPS = NUM_WARPS
-        self.NUM_STAGES = NUM_STAGES
-
-        self.register_buffer(
-            "channel_mask",
+        self.register_buffer("channel_mask",
             torch.ones(out_channels, dtype=torch.bool),
             persistent=True,
         )
@@ -62,30 +61,25 @@ class TritonConv2d(torch.nn.Module):
             torch.ones(in_channels, dtype=torch.bool),
             persistent=True,
         )
-        self.block_size = None
         self.register_buffer("grad_channel_mask", None, persistent=True)
         self.register_buffer("grad_input_channel_mask", None, persistent=True)
-        self.grad_block_size = None
-
 
     def forward(self, x):
         assert x.is_cuda and self.weight.is_cuda
         x_in = x.half()
         w_in = self.weight.half()
 
-        y = TritonConv2dFn.apply(
+        y_half = TritonConv2dFn.apply(
             x_in, w_in, self.bias,
             self._resolved_channel_mask(),
             self._resolved_input_mask(),
             self._resolved_grad_channel_mask(),
             self._resolved_grad_input_mask(),
             self.stride, self.padding, self.dilation,
-            self.BLOCK_M, self.BLOCK_N, self.BLOCK_K,
-            self.NUM_WARPS, self.NUM_STAGES,
         )
-        return y  # оставляем выход в fp16, как требует baseline сценарий
+        return y_half.to(x.dtype)
 
-    # ===== Sparsity helpers =====
+    # Sparsity helpers
     def set_channel_mask(self, mask: torch.Tensor | None):
         if mask is None:
             self.channel_mask = torch.ones(
@@ -166,7 +160,7 @@ class TritonConv2d(torch.nn.Module):
     def clear_input_sparsity(self):
         self.input_channel_mask.fill_(True)
 
-    # ===== Backward sparsity helpers =====
+    # Backward sparsity helpers
     def set_backward_channel_mask(self, mask: torch.Tensor | None):
         if mask is None:
             self.grad_channel_mask = None

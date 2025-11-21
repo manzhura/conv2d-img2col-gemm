@@ -6,15 +6,18 @@ from conv_gemm.baseline_operators.triton_conv2d_int8_fn import TritonConv2dInt8F
 
 
 class TritonConv2dINT8(nn.Module):
-    """
-    Обёртка над TritonConv2dInt8Fn:
-    - хранит INT8-веса и их scale
-    - хранит scale для активаций
-    - НЕ занимается квантизацией внутри forward
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size,
-                 stride=1, padding=0, dilation=1, bias=True):
+    def __init__(
+        self, in_channels, out_channels, kernel_size,
+        stride=1, padding=0, dilation=1, bias=True):
+        """
+        INT8-свёртка на Triton (инференс-only).
+        Возможности:
+        • Веса и активации заранее квантованы (PTQ / QAT), внутри слоя квантизации нет.
+        • forward: чистый INT8 → INT32 акумуляция → FP32 bias → FP32 выход.
+        • Использует TritonConv2dInt8Fn: im2col → INT8 GEMM → col2img.
+        • Один скалярный scale для весов и один для активаций.
+        • Веса и bias не обучаемые (requires_grad=False).
+        """
         super().__init__()
 
         if isinstance(kernel_size, int):
@@ -33,17 +36,17 @@ class TritonConv2dINT8(nn.Module):
         self.padding = padding
         self.dilation = dilation
 
-        # INT8 веса (квантизованные извне)
+        # weights initialization
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels, kh, kw, dtype=torch.int8),
             requires_grad=False,
         )
 
-        # Один скалярный scale для весов
+        # weights scale
         self.register_buffer("weight_scale", torch.tensor(1.0, dtype=torch.float32))
-        # zp для симметрии не используется, но оставим для совместимости
         self.register_buffer("weight_zp", torch.tensor(0, dtype=torch.int32))
 
+        #  zero bias initialization
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(out_channels, dtype=torch.float32),
@@ -52,11 +55,10 @@ class TritonConv2dINT8(nn.Module):
         else:
             self.bias = None
 
-        # Scale для активаций (один скаляр, калибруется извне)
+        # input scale
         self.register_buffer("act_scale", torch.tensor(1.0, dtype=torch.float32))
         self.register_buffer("act_zp", torch.tensor(0, dtype=torch.int32))
 
-    # ==== ЗАГРУЗКА КВАНТ-ПАРАМОВ (вызов из PTQ-калибратора) ====
     @torch.no_grad()
     def load_quant_params(self,
                           w_q: torch.Tensor,
@@ -64,11 +66,11 @@ class TritonConv2dINT8(nn.Module):
                           act_scale: torch.Tensor,
                           bias: torch.Tensor | None = None):
         """
-        Сюда приходят УЖЕ ГОТОВЫЕ:
-          - w_q: int8 веса формы [Cout, Cin, Kh, Kw]
-          - w_scale: скалярный scale для весов
-          - act_scale: скалярный scale для активаций
-        НИКАКОЙ квантизации здесь нет — только copy_ внутрь слоя.
+        Загружает уже готовые квантованные параметры:
+        • w_q - int8 веса [Cout, Cin, Kh, Kw]
+        • w_scale - scale для весов (скаляр)
+        • act_scale - scale для активаций (скаляр)
+        • bias - опционально FP32 bias
         """
 
         assert w_q.dtype == torch.int8, f"w_q must be int8, got {w_q.dtype}"
@@ -87,14 +89,18 @@ class TritonConv2dINT8(nn.Module):
             )
             self.bias.copy_(bias.float())
 
-    # ==== ИНФЕРЕНС ====
     def forward(self, x_q: torch.Tensor):
         """
-        СЮДА ПРИХОДИТ УЖЕ КВАНТИЗОВАННЫЙ x_q (int8),
-        сконверченный с использованием self.act_scale.
-        НИКАКОЙ КВАНТИЗАЦИИ ВНУТРИ НЕ ДЕЛАЕМ.
+        INT8-инференс.
+        Ожидает:
+        • x_q - уже квантованный int8 вход (scale = self.act_scale).
+        Выполняет:
+        • im2col (int8)
+        • INT8×INT8 → INT32 GEMM в Triton
+        • добавление FP32 bias
+        • col2img → FP32 выход
+        Никакого обучения, никакого квантизирования внутри.
         """
-
         assert x_q.dtype == torch.int8, f"expected int8 input, got {x_q.dtype}"
         assert x_q.is_cuda, "x_q must be on CUDA"
 
@@ -109,13 +115,15 @@ class TritonConv2dINT8(nn.Module):
             self.act_scale,
         )
 
-    # ==== УДОБНЫЙ ХЕЛПЕР ДЛЯ КВАНТИЗАЦИИ ВХОДА С УЖЕ ЗАДАННЫМ act_scale ====
+    # helper для PTQ
     @torch.no_grad()
     def quantize_input(self, x_fp: torch.Tensor) -> torch.Tensor:
         """
+        Квантование входа по заранее известному act_scale
+        x_q = round(x_fp / act_scale).
+        scale не пересчитывается.
         """
         x_fp = x_fp.to(torch.float32)
         s = float(self.act_scale)
-        # Здесь НЕТ пересчёта scale – только "apply" уже известного
         x_q = torch.clamp(torch.round(x_fp / s), -128, 127).to(torch.int8)
         return x_q

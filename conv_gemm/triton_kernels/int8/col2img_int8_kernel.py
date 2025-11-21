@@ -2,9 +2,6 @@ import triton
 import triton.language as tl
 import torch
 
-INT32_C2I_BLOCK_M = 64
-INT32_C2I_BLOCK_K = 32
-
 
 @triton.jit
 def col2img_int32_kernel(
@@ -17,10 +14,6 @@ def col2img_int32_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    cols_ptr: int32 [M,K]
-    x_ptr:   int32 [N, Cin, H, W]
-    """
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
 
@@ -31,7 +24,6 @@ def col2img_int32_kernel(
     mask_m = offs_m < M
     mask_k = offs_k < K
 
-    # offs_m -> (n, ho, wo)
     n  = offs_m // (Ho * Wo)
     t  = offs_m %  (Ho * Wo)
     ho = t // Wo
@@ -41,7 +33,6 @@ def col2img_int32_kernel(
     ho = ho[:, None]
     wo = wo[:, None]
 
-    # offs_k -> (cin, kh, kw)
     cin = offs_k // (Kh * Kw)
     r   = offs_k %  (Kh * Kw)
     kh  = r // Kw
@@ -72,8 +63,9 @@ def col2img_int32_kernel(
 
 
 def col2img_int32(
-    cols_i32: torch.Tensor,  # [M, K] int32, M = N*Ho*Wo, K = Cin*Kh*Kw
-    N: int, Cin: int, H: int, W: int,
+    cols_i32: torch.Tensor,
+    N: int, Cin: int,
+    H: int, W: int,
     Kh: int, Kw: int,
     Sh: int, Sw: int,
     Ph: int, Pw: int,
@@ -91,7 +83,6 @@ def col2img_int32(
     assert cols_i32.dtype == torch.int32
     cols_i32 = cols_i32.contiguous()
 
-    # считаем Ho, Wo так же, как в img2col
     Ho = (H + 2 * Ph - Dh * (Kh - 1) - 1) // Sh + 1
     Wo = (W + 2 * Pw - Dw * (Kw - 1) - 1) // Sw + 1
     M = N * Ho * Wo
@@ -116,5 +107,4 @@ def col2img_int32(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-
     return x_i32

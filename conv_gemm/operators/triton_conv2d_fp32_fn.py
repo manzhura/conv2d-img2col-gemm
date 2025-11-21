@@ -54,7 +54,7 @@ class TritonConv2dFn(torch.autograd.Function):
             use_fp16=(cols_dtype == torch.float16),
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             num_warps=NUM_WARPS, num_stages=NUM_STAGES
-        )  # fp32 output
+        )  # fp16 output
 
         if bias is not None:
             y_col.add_(bias.float().view(1, -1))
@@ -81,7 +81,7 @@ class TritonConv2dFn(torch.autograd.Function):
         BLOCK_M, BLOCK_N, BLOCK_K = ctx.blocks
         NUM_WARPS, NUM_STAGES = ctx.launch
 
-        # всё в fp32
+        # всё в fp16
         gy32 = gy.float()
         w32  = w.float()
         x32  = x.float()

@@ -7,8 +7,7 @@ QMAX = 127
 @torch.no_grad()
 def quantize_int8_sym_tensor(x: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    СТАРАЯ, БЫСТРАЯ, СТАБИЛЬНАЯ КВАНТИЗАЦИЯ.
-    zp возвращаем, но не используем.
+    Симметричная тензорная квантизация
     """
     x_fp = x.float()
 
@@ -21,5 +20,5 @@ def quantize_int8_sym_tensor(x: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.
         scale = max_abs / float(QMAX)
         x_q = torch.clamp((x_fp / scale).round(), QMIN, QMAX).to(torch.int8)
 
-    zp = torch.tensor(0.0, device=x.device)  # zp возвращаем, но НЕ используем
+    zp = torch.tensor(0.0, device=x.device)
     return x_q, scale, zp
