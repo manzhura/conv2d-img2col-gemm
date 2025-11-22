@@ -44,8 +44,8 @@
 ## Установка
 
 ```bash
-git clone https://github.com/your/repo.git
-cd repo
+git https://github.com/manzhura/conv2d-img2col-gemm.git
+cd conv2d-img2col-gemm
 
 python3 -m venv venv
 source venv/bin/activate          
