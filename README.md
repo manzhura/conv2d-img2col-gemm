@@ -1,26 +1,85 @@
-Обзор:
-1) Исследовать классическую реализацию nn.Conv2d в PyTorch.
-2) Реализовать преобразование свёртки в форму img2col, чтобы свести задачу к матричному умножению (GEMM).
-3) Рассмотреть разные подходы к оптимизации:
-          - спарсификация весов (ускорение за счёт разреженности)
-          - квантование (fp16 → int8)
+# Conv2d Reimagined: img2col, GEMM, Sparsity & INT8 Quantization
 
-Экспериментальная часть:
-1) Реализовать преобразование Conv2d → img2col → GEMM.
-2) Добавить оптимизации:
-          - спарсификация весов
-          - квантование активаций/весов
-3) Подключить данный блок в простую модель (например, LeNet или ResNet18) вместо стандартного nn.Conv2d.
-4) Запустить обучение и сравнить:
-           - forward и backward время
-           - использование GPU памяти
-5) Провести сравнение на разных размерах ядер (3×3, 5×5, 7×7) и разных batch size.
+Проект исследует реализацию Conv2d через разложение:
+**img2col → GEMM → col2img**  
+и анализирует влияние **квантизации (INT8)** и **спарсификации** на производительность.
 
-Критерии проекта
-1) Реализовано преобразование Conv2d в img2col + GEMM.
-2) Реализованы два типа оптимизации: спарсификация и квантование.
-3) Получено ускорение ≥15% хотя бы на одном размере ядра или batch size.
-4) Подготовлен отчёт с таблицами метрик (время, использование памяти).
-5) Подготовлен целостный GitHub-репозиторий с кодом и инструкцией по воспроизведению.
+Реализованы собственные Triton-ядра для FP16 и INT8, собственные Conv2d-слои, PTQ-квантование, forward/backward для FP16, INT8-inference, а так же бенчмарк для них.
 
-P.S.Все эксперименты должны сопровождаться замером времени выполнения (с обязательным вызовом cuda.synchronize() для корректности измерений).
+## Возможности
+
+### FP16 (полная поддержка)
+- FP16 img2col
+- FP16 GEMM
+- FP16 col2img
+- TritonConv2d: forward (FP16) + backward (FP32)
+- Sparsity:
+  - input-channel sparsity
+  - output-channel sparsity
+  - block sparsity
+  - отдельные маски для forward/backward
+
+### INT8 (inference-only)
+- INT8 img2col
+- INT8 GEMM
+- INT32 col2img 
+- TritonConv2d: forward (INT8)
+- PTQ-квантование:
+  - symmetric per-tensor scale
+  - квантованные веса (int8)
+  - bias — FP32
+
+### Benchmarking
+- Сравнение PyTorch Conv2d (FP16) и Triton FP16/INT8
+- Перебор сетки параметров:
+  N, Cin, Cout, H, K, S, P
+- Метрики:
+  - forward time
+  - backward time (FP16)
+  - speedup
+  - MAE / max error
+  - выделенная память
+- Сохранение всех результатов в CSV
+
+## Установка
+
+```bash
+git clone https://github.com/your/repo.git
+cd repo
+
+python3 -m venv venv
+source venv/bin/activate          
+
+pip install -r requirements.txt
+```
+
+## Структура проекта
+
+conv2d-img2col-gemm/
+│
+├── conv_gemm/
+│   ├── baseline_layers/
+│   │   ├── triton_conv2d.py
+│   │   ├── triton_conv2d_int8.py
+│   │   └── triton_conv2d_fp16.py  
+│   ├── baseline_operators/
+│   │   ├── triton_conv2d_fp16_fn.py
+│   │   └── triton_conv2d_int8_fn.py
+│   ├── configs/
+│   │   └── kernel_config.py
+│   └── triton_kernels/
+│       ├── fp16/
+│       │   ├── img2col_kernel.py
+│       │   ├── gemm_kernel.py
+│       │   └── col2img_kernel.py
+│       └── int8/
+│           ├── img2col_int8_kernel.py
+│           ├── gemm_int8_kernel.py
+│           ├── col2img_int8_kernel.py
+│           └── int8_quant.py
+├── notebooks/
+│   └── (бенчмарки, эксперименты)
+├── data/
+│   └── (empty)
+├── README.md
+└── requirements.txt
