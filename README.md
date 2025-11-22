@@ -55,31 +55,29 @@ pip install -r requirements.txt
 
 ## Структура проекта
 
+```
 conv2d-img2col-gemm/
-│
-├── conv_gemm/
-│   ├── baseline_layers/
-│   │   ├── triton_conv2d.py
-│   │   ├── triton_conv2d_int8.py
-│   │   └── triton_conv2d_fp16.py  
-│   ├── baseline_operators/
-│   │   ├── triton_conv2d_fp16_fn.py
-│   │   └── triton_conv2d_int8_fn.py
-│   ├── configs/
-│   │   └── kernel_config.py
-│   └── triton_kernels/
-│       ├── fp16/
-│       │   ├── img2col_kernel.py
-│       │   ├── gemm_kernel.py
-│       │   └── col2img_kernel.py
-│       └── int8/
-│           ├── img2col_int8_kernel.py
-│           ├── gemm_int8_kernel.py
-│           ├── col2img_int8_kernel.py
-│           └── int8_quant.py
-├── notebooks/
-│   └── (бенчмарки, эксперименты)
-├── data/
-│   └── (empty)
-├── README.md
-└── requirements.txt
+  conv_gemm/
+    baseline_layers/
+      triton_conv2d.py
+      triton_conv2d_int8.py
+    baseline_operators/
+      triton_conv2d_fp16_fn.py
+      triton_conv2d_int8_fn.py
+    configs/
+      kernel_config.py
+    triton_kernels/
+      fp16/
+        img2col_kernel.py
+        gemm_kernel.py
+        col2img_kernel.py
+      int8/
+        img2col_int8_kernel.py
+        gemm_int8_kernel.py
+        col2img_int8_kernel.py
+        int8_quant.py
+  notebooks/
+  data/
+  README.md
+  requirements.txt
+```
