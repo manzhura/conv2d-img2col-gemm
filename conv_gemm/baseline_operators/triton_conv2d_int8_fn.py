@@ -10,9 +10,9 @@ from conv_gemm.triton_kernels.int8.img2col_int8_kernel import img2col_int8
 from conv_gemm.triton_kernels.int8.gemm_int8_kernel  import gemm_int8_tc
 from conv_gemm.triton_kernels.int8.col2img_int8_kernel import col2img_int32
 from conv_gemm.triton_kernels.int8.int8_quant import quantize_int8_sym_tensor
-from conv_gemm.triton_kernels.fp32.img2col_kernel import img2col_kernel
-from conv_gemm.triton_kernels.fp32.col2img_kernel import col2img_kernel
-from conv_gemm.triton_kernels.fp32.gemm_kernel import triton_gemm
+from conv_gemm.triton_kernels.fp16.img2col_kernel import img2col_kernel
+from conv_gemm.triton_kernels.fp16.col2img_kernel import col2img_kernel
+from conv_gemm.triton_kernels.fp16.gemm_kernel import triton_gemm
 from conv_gemm.configs.kernel_config import INT8_C2I_CFG, INT8_GEMM_CFG, INT8_I2C_CFG
 
 
@@ -61,7 +61,7 @@ class TritonConv2dInt8Fn(Function):
             INT8_I2C_CFG.BLOCK_M,
             INT8_I2C_CFG.BLOCK_K,
             INT8_I2C_CFG.NUM_WARPS,
-            INT8_I2C_STAGES.NUM_STAGES,
+            INT8_I2C_CFG.NUM_STAGES,
         )
 
         Wmat = w_q.view(Cout, K_real).t().contiguous()
